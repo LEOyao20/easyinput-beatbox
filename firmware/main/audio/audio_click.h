@@ -45,6 +45,13 @@ uint8_t audio_click_get_volume(void);
  */
 esp_err_t audio_click_set_running(bool running, bool restart);
 
+/**
+ * Monotonic count of drum voices started: sequencer steps plus pad-triggered
+ * notes. The UI compares successive reads and flashes on any change, so only
+ * the delta between polls is meaningful -- never the absolute value.
+ */
+uint32_t audio_click_drum_hit_count(void);
+
 /** Non-blocking position / beat event for LED/host visualization. */
 bool audio_click_poll_beat(audio_beat_event_t *event);
 

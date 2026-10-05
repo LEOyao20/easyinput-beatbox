@@ -11,19 +11,28 @@ extern "C" {
 
 esp_err_t led_status_init(void);
 esp_err_t led_status_set_solid_rgb(uint8_t r, uint8_t g, uint8_t b);
+esp_err_t led_status_clear(void);
 
 /**
- * Trigger the next beat position on the five-pixel ping-pong path.
+ * Everything the strip needs to render one frame.
+ *
+ * Layout on the 5-pixel strip:
+ *   pixel 0    steady mode colour, derived from running / variation / fill
+ *   pixels 1-4 hit array; all four flash together whenever `drum_hits` moves
  */
-void led_status_on_beat(uint8_t step, bool is_accent, int64_t now_us);
+typedef struct {
+    bool running;       /* transport running (false = free / idle mode) */
+    uint8_t variation;  /* 0 = bank A, 1 = bank B */
+    bool fill;          /* long-press fill engaged; overrides A/B */
+    uint16_t bpm;       /* used only by the encoder tempo preview */
+    uint32_t drum_hits; /* monotonic counter, see audio_click_drum_hit_count() */
+} led_status_input_t;
 
-/** Render a smooth light-transfer animation; call roughly every 10–20 ms. */
-esp_err_t led_status_update(int64_t now_us, uint16_t bpm, bool running);
+/** Render one frame; call every ~20 ms. */
+esp_err_t led_status_update(int64_t now_us, const led_status_input_t *input);
 
 /** Briefly visualize the BPM range after an encoder turn. */
 void led_status_show_tempo(uint16_t bpm, int64_t now_us);
-
-esp_err_t led_status_clear(void);
 
 #ifdef __cplusplus
 }

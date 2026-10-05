@@ -2,16 +2,76 @@
 
 #include "board_pins.h"
 #include "board_power.h"
+#include "clock.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "led_strip.h"
 
 static const char *TAG = "led_status";
 static led_strip_handle_t s_strip;
-static int64_t s_last_beat_us;
+
+/*
+ * Strip layout. The WS2812 chain runs RIGHT-TO-LEFT on this board, so index 0
+ * is the rightmost lamp and the highest index is the leftmost one. The mode
+ * indicator therefore lives at the LAST index, which puts it at the far left
+ * of the keyboard as seen by the player, with the four hit pixels filling the
+ * remaining positions to its right.
+ *
+ * The mode pixel is never animated, so the current mode stays readable while
+ * the hit array is flashing beside it.
+ */
+#define MODE_PIXEL (BOARD_WS2812_COUNT - 1)
+#define HIT_FIRST_PIXEL 0
+#define HIT_PIXEL_COUNT (BOARD_WS2812_COUNT - 1)
+#define HIT_SPAN (HIT_PIXEL_COUNT - 1)
+
+/*
+ * Mode palette. Each entry owns a distinct region of the colour wheel so the
+ * status is unambiguous at a glance: blue (idle) / green (A) / purple (B) /
+ * red (fill).
+ */
+#define MODE_IDLE_R 0
+#define MODE_IDLE_G 40
+#define MODE_IDLE_B 255 /* 自由模式（停止待机） */
+#define MODE_A_R 0
+#define MODE_A_G 220
+#define MODE_A_B 40 /* Pattern A */
+#define MODE_B_R 150
+#define MODE_B_G 0
+#define MODE_B_B 255 /* Pattern B */
+#define MODE_FILL_R 255
+#define MODE_FILL_G 0
+#define MODE_FILL_B 0 /* 长按加花 */
+
+/* Idle is dimmer than playing, so the strip reads as "armed" vs "running". */
+#define MODE_IDLE_SCALE 96
+#define MODE_ACTIVE_SCALE 170
+
+/*
+ * Hit flash: warm white. Desaturated on purpose -- the four mode colours are
+ * all saturated hues, so a neutral flash can never be mistaken for the mode
+ * indicator. Brightness is carried entirely by `scale`.
+ */
+#define HIT_R 255
+#define HIT_G 240
+#define HIT_B 210
+
+/*
+ * Flash length. Longer than the ~20 ms render frame so the decay is actually
+ * visible, shorter than a 16th note even at the 240 BPM maximum (62 ms) so
+ * consecutive hits stay individually legible.
+ */
+#define HIT_FLASH_US 150000
+
+/* The encoder BPM preview borrows the hit array as a single position marker. */
+#define PREVIEW_R 255
+#define PREVIEW_G 140
+#define PREVIEW_B 0
+#define PREVIEW_SCALE 110
+
+static int64_t s_hit_us;
+static uint32_t s_last_hits;
 static int64_t s_tempo_preview_until_us;
-static uint8_t s_step;
-static bool s_accent;
 static uint16_t s_preview_bpm;
 
 static uint8_t scale_u8(uint8_t value, uint8_t scale)
@@ -23,13 +83,6 @@ static esp_err_t set_rgb(uint8_t index, uint8_t r, uint8_t g, uint8_t b, uint8_t
 {
     return led_strip_set_pixel(s_strip, index, scale_u8(r, scale), scale_u8(g, scale),
                                scale_u8(b, scale));
-}
-
-/* 0 → 1 → 2 → 3 → 4 → 3 → 2 → 1, then repeat. */
-static uint8_t path_index(uint8_t step)
-{
-    const uint8_t phase = step & 0x07;
-    return phase <= 4 ? phase : (uint8_t)(8 - phase);
 }
 
 esp_err_t led_status_init(void)
@@ -51,7 +104,7 @@ esp_err_t led_status_init(void)
     ESP_RETURN_ON_ERROR(led_strip_new_rmt_device(&strip_config, &rmt_config, &s_strip), TAG,
                         "led_strip_new_rmt_device failed");
     ESP_RETURN_ON_ERROR(led_strip_clear(s_strip), TAG, "clear failed");
-    ESP_LOGI(TAG, "WS2812 ready (%d pixels, spring + breath animation)", BOARD_WS2812_COUNT);
+    ESP_LOGW(TAG, "WS2812 ready (%d pixels: 1 mode + 4 hit)", BOARD_WS2812_COUNT);
     return ESP_OK;
 }
 
@@ -70,66 +123,92 @@ esp_err_t led_status_clear(void)
     return led_strip_clear(s_strip);
 }
 
-void led_status_on_beat(uint8_t step, bool is_accent, int64_t now_us)
-{
-    s_step = step;
-    s_accent = is_accent;
-    s_last_beat_us = now_us;
-}
-
 void led_status_show_tempo(uint16_t bpm, int64_t now_us)
 {
     s_preview_bpm = bpm;
     s_tempo_preview_until_us = now_us + 450000;
 }
 
-esp_err_t led_status_update(int64_t now_us, uint16_t bpm, bool running)
+/*
+ * Squared falloff. The hit appears at full brightness on the frame after it
+ * is detected and then decays fast, which reads as a struck indicator rather
+ * than a slow fade.
+ */
+static uint8_t hit_level(int64_t now_us)
+{
+    int64_t age = now_us - s_hit_us;
+    if (age < 0) {
+        age = 0;
+    }
+    if (age >= HIT_FLASH_US) {
+        return 0;
+    }
+    /* 64-bit: 255 * 150000^2 does not fit in 32 bits. */
+    const uint64_t total = HIT_FLASH_US;
+    const uint64_t remain = (uint64_t)(HIT_FLASH_US - age);
+    return (uint8_t)((255u * remain * remain) / (total * total));
+}
+
+esp_err_t led_status_update(int64_t now_us, const led_status_input_t *input)
 {
     ESP_RETURN_ON_FALSE(s_strip != NULL, ESP_ERR_INVALID_STATE, TAG, "not inited");
+    ESP_RETURN_ON_FALSE(input != NULL, ESP_ERR_INVALID_ARG, TAG, "no input");
     ESP_RETURN_ON_ERROR(led_strip_clear(s_strip), TAG, "clear");
 
-    if (now_us < s_tempo_preview_until_us) {
-        /* One short amber marker; never turn the whole strip into a bar. */
-        uint16_t normalized = s_preview_bpm > 60 ? (uint16_t)(s_preview_bpm - 60) : 0;
-        if (normalized > 180) {
-            normalized = 180;
+    /* --- pixel 0: mode indicator, steady and always meaningful --- */
+    uint8_t r = MODE_IDLE_R;
+    uint8_t g = MODE_IDLE_G;
+    uint8_t b = MODE_IDLE_B;
+    uint8_t scale = MODE_IDLE_SCALE;
+    if (input->fill) {
+        /* Fill wins over A/B: it is the layer actually being heard. */
+        r = MODE_FILL_R;
+        g = MODE_FILL_G;
+        b = MODE_FILL_B;
+        scale = MODE_ACTIVE_SCALE;
+    } else if (input->running) {
+        if (input->variation) {
+            r = MODE_B_R;
+            g = MODE_B_G;
+            b = MODE_B_B;
+        } else {
+            r = MODE_A_R;
+            g = MODE_A_G;
+            b = MODE_A_B;
         }
-        const uint8_t marker = (uint8_t)((normalized * 4u + 90u) / 180u);
-        ESP_RETURN_ON_ERROR(set_rgb(marker, 255, 64, 0, 72), TAG, "tempo marker");
+        scale = MODE_ACTIVE_SCALE;
+    }
+    ESP_RETURN_ON_ERROR(set_rgb(MODE_PIXEL, r, g, b, scale), TAG, "mode pixel");
+
+    /* --- pixels 1..4: hit array --- */
+    if (input->drum_hits != s_last_hits) {
+        s_last_hits = input->drum_hits;
+        s_hit_us = now_us;
+    }
+
+    if (now_us < s_tempo_preview_until_us) {
+        /* Encoder BPM preview borrows the hit array: one marker whose
+         * position encodes the tempo, so the pixels stay meaningful. */
+        const uint16_t span = BEATBOX_BPM_MAX - BEATBOX_BPM_MIN;
+        uint16_t offset =
+            s_preview_bpm > BEATBOX_BPM_MIN ? (uint16_t)(s_preview_bpm - BEATBOX_BPM_MIN) : 0;
+        if (offset > span) {
+            offset = span;
+        }
+        const uint8_t marker =
+            (uint8_t)(HIT_FIRST_PIXEL + (offset * HIT_SPAN + span / 2u) / span);
+        ESP_RETURN_ON_ERROR(set_rgb(marker, PREVIEW_R, PREVIEW_G, PREVIEW_B, PREVIEW_SCALE), TAG,
+                            "tempo marker");
         return led_strip_refresh(s_strip);
     }
 
-    if (!running) {
-        /* A stopped instrument is visually quiet. */
-        return led_strip_refresh(s_strip);
+    const uint8_t level = hit_level(now_us);
+    if (level > 0) {
+        for (uint8_t i = 0; i < HIT_PIXEL_COUNT; ++i) {
+            ESP_RETURN_ON_ERROR(
+                set_rgb((uint8_t)(HIT_FIRST_PIXEL + i), HIT_R, HIT_G, HIT_B, level), TAG,
+                "hit pixel");
+        }
     }
-
-    const int64_t period_us = 60000000LL / (bpm < 60 ? 60 : bpm);
-    int64_t elapsed = now_us - s_last_beat_us;
-    if (elapsed < 0) {
-        elapsed = 0;
-    }
-    if (elapsed > period_us) {
-        elapsed = period_us;
-    }
-
-    /*
-     * Smoothstep crossfade preserves perceived energy: light appears to move
-     * between adjacent pixels instead of one pixel snapping off and another
-     * snapping on. Only those two pixels are lit.
-     */
-    const float phase = (float)elapsed / (float)period_us;
-    const float transfer = phase * phase * (3.0f - 2.0f * phase);
-    const uint8_t from_level = (uint8_t)(185.0f * (1.0f - transfer));
-    const uint8_t to_level = (uint8_t)(185.0f * transfer);
-    const uint8_t from = path_index(s_step);
-    const uint8_t to = path_index((uint8_t)(s_step + 1));
-
-    if (s_accent && phase < 0.35f) {
-        ESP_RETURN_ON_ERROR(set_rgb(from, 255, 105, 10, from_level), TAG, "accent transfer");
-    } else {
-        ESP_RETURN_ON_ERROR(set_rgb(from, 255, 38, 0, from_level), TAG, "from transfer");
-    }
-    ESP_RETURN_ON_ERROR(set_rgb(to, 255, 38, 0, to_level), TAG, "to transfer");
     return led_strip_refresh(s_strip);
 }

@@ -17,7 +17,6 @@ static uint8_t s_last_beat_in_bar;
 static uint8_t s_last_step;
 static uint32_t s_last_bar;
 static uint16_t s_last_tick;
-static uint32_t s_quarter_count;
 static bool s_prev_keys[8];
 static bool s_fill_held;
 /*
@@ -51,7 +50,7 @@ static void apply_encoder_bpm(int8_t delta)
     ESP_LOGI(TAG, "BPM -> %u", tempo_get_bpm());
 }
 
-static void render_event(const audio_beat_event_t *event, int64_t now_us)
+static void render_event(const audio_beat_event_t *event)
 {
     s_last_beat_in_bar = event->beat_in_bar;
     s_last_step = event->step;
@@ -69,9 +68,7 @@ static void render_event(const audio_beat_event_t *event, int64_t now_us)
      * instead of emitting both lines unconditionally on every tick.
      */
     if (event->is_quarter) {
-        led_status_on_beat((uint8_t)(s_quarter_count & 0xff), event->accent, now_us);
         host_link_send_beat(event->accent, event->beat_in_bar, event->step);
-        s_quarter_count++;
     }
     if (event->is_step) {
         host_link_send_position(event->bar, event->step, event->beat_in_bar, event->tick,
@@ -99,7 +96,6 @@ static void transport_set(bool running, bool restart, bool from_host)
             s_last_step = 0;
             s_last_bar = 0;
             s_last_tick = 0;
-            s_quarter_count = 0;
         }
         if (s_audio_ready) {
             (void)audio_click_set_bpm(tempo_get_bpm());
@@ -421,12 +417,25 @@ void app_main(void)
 
         audio_beat_event_t beat_event;
         while (s_audio_ready && audio_click_poll_beat(&beat_event)) {
-            render_event(&beat_event, now);
+            render_event(&beat_event);
         }
 
         if (now - last_led_frame_us >= 20000) {
             last_led_frame_us = now;
-            (void)led_status_update(now, tempo_get_bpm(), tempo_is_running());
+            /*
+             * Pixel 0 mirrors the live mode; pixels 1-4 flash on the hit
+             * counter. `fill` is read from the pattern layer rather than the
+             * mirrored s_fill_held so the LED can never disagree with what the
+             * sequencer is actually playing.
+             */
+            const led_status_input_t led_in = {
+                .running = tempo_is_running(),
+                .variation = pattern_variation(),
+                .fill = pattern_fill_active(),
+                .bpm = tempo_get_bpm(),
+                .drum_hits = s_audio_ready ? audio_click_drum_hit_count() : 0,
+            };
+            (void)led_status_update(now, &led_in);
         }
 
         if (now - last_status_us > 500000) {

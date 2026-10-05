@@ -364,6 +364,42 @@ static esp_err_t queue_voice(voice_kind_t kind, uint8_t velocity)
     return xQueueSend(s_request_queue, &request, 0) == pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
+/*
+ * Drum-hit counter for the LED hit array.
+ *
+ * Written only from the audio task, so it needs no lock: the UI treats the
+ * value as opaque and merely watches for a change, which makes a torn read
+ * cost at most one missed flash instead of a correctness problem.
+ */
+static volatile uint32_t s_drum_hits;
+
+/*
+ * A "hit" is ANY instrument starting: kick, snare, both hats, clap or rim,
+ * whether it came from the sequencer or from a pad. The metronome click is
+ * the single exception -- it is a timekeeper, not music, so it must never
+ * light the hit array.
+ *
+ * Enumerated explicitly rather than by enum ordering: `kind >= VOICE_KICK`
+ * would silently break if anyone reordered voice_kind_t or inserted a new
+ * silent voice. Adding an instrument here is a deliberate act.
+ */
+static bool voice_is_drum(voice_kind_t kind)
+{
+    switch (kind) {
+    case VOICE_KICK:
+    case VOICE_SNARE:
+    case VOICE_CHH:
+    case VOICE_OHH:
+    case VOICE_CLAP:
+    case VOICE_RIM:
+        return true;
+    case VOICE_CLICK_NORMAL:
+    case VOICE_CLICK_ACCENT:
+        return false;
+    }
+    return false;
+}
+
 static void sequencer_note_trampoline(uint8_t note, uint8_t velocity)
 {
     if (s_seq_note_count >= BEATBOX_TRACK_COUNT) {
@@ -432,6 +468,9 @@ static void audio_task(void *argument)
         audio_request_t request;
         while (xQueueReceive(s_request_queue, &request, 0) == pdTRUE) {
             start_voice(voices, request.kind, request.velocity, voice_age++);
+            if (voice_is_drum(request.kind)) {
+                s_drum_hits++;
+            }
         }
 
         for (uint32_t frame = 0; frame < AUDIO_BLOCK_FRAMES; ++frame) {
@@ -456,6 +495,9 @@ static void audio_task(void *argument)
                         start_voice(voices, s_seq_notes[i].kind, s_seq_notes[i].velocity,
                                     voice_age++);
                     }
+                    /* Count every step that actually fired, so a dense step
+                     * reads as one strong flash rather than several. */
+                    s_drum_hits += s_seq_note_count;
                 }
 
                 if (on_quarter && control.metronome) {
@@ -656,6 +698,11 @@ esp_err_t audio_click_play_accent(void)
 esp_err_t audio_click_play_note(uint8_t note, uint8_t velocity)
 {
     return queue_voice(note_to_voice(note), velocity);
+}
+
+uint32_t audio_click_drum_hit_count(void)
+{
+    return s_drum_hits;
 }
 
 void audio_click_get_position(uint32_t *bar, uint8_t *step, uint8_t *beat, uint16_t *tick)
