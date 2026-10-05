@@ -1,0 +1,8 @@
+# Windows batch launchers must keep CRLF line endings.
+#
+# cmd.exe reads a .cmd/.bat file by BYTE OFFSET, so an LF-only script can make
+# it resume mid-line -- labels (goto) resolve wrongly and fragments of the
+# file get executed as commands. Pin the endings here instead of relying on
+# each machine's core.autocrlf setting.
+*.cmd text eol=crlf
+*.bat text eol=crlf
