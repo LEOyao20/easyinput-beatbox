@@ -17,6 +17,20 @@ extern "C" {
 esp_err_t host_link_init(void);
 bool host_link_ready(void);
 
+/**
+ * RX instrumentation. `bytes` counts raw bytes pulled off stdin, `lines` counts
+ * completed newline-terminated commands dispatched. If the host writes but
+ * `lines` stays 0, inbound data is not reaching this task.
+ *
+ * `errs` / `errno` separate the two ways that can happen: a genuinely empty
+ * queue (no error) versus a broken read path (errs climbing while bytes stays
+ * 0 -- the signature of stdin served by an uninstalled USB-Serial/JTAG driver).
+ */
+uint32_t host_link_rx_bytes(void);
+uint32_t host_link_rx_lines(void);
+uint32_t host_link_rx_errs(void);
+int host_link_rx_errno(void);
+
 void host_link_send_hello(void);
 void host_link_send_start(void);
 void host_link_send_continue(void);

@@ -11,7 +11,7 @@ import {
 } from "lucide";
 import "./styles.css";
 import { DRUM_ICONS, type DrumIconId } from "./drum-icons";
-import { BeatboxLink } from "./link";
+import { BeatboxLink, linkDebug } from "./link";
 import {
   clearPattern,
   clearTrack,
@@ -164,6 +164,10 @@ root.innerHTML = `
 
       <div class="error" id="err" hidden></div>
     </section>
+    <div class="debug-fixed" id="dbg">
+      <div class="debug-head">DIAGNOSTIC</div>
+      <pre id="dbgBody">waiting…</pre>
+    </div>
 
     <section class="panel drum">
       <div class="panel-head">
@@ -317,6 +321,7 @@ const els = {
   drumEnable: root.querySelector<HTMLInputElement>("#drumEnable")!,
   drumState: root.querySelector<HTMLElement>("#drumState")!,
   err: root.querySelector<HTMLElement>("#err")!,
+  dbgBody: root.querySelector<HTMLElement>("#dbgBody")!,
   btnBankA: root.querySelector<HTMLButtonElement>("#btnBankA")!,
   btnBankB: root.querySelector<HTMLButtonElement>("#btnBankB")!,
   btnBankFill: root.querySelector<HTMLButtonElement>("#btnBankFill")!,
@@ -415,8 +420,13 @@ function toggleTransport() {
     stopTransportAndRecording();
     return;
   }
-  if (s.bar === 0 && s.step === 0 && s.tick === 0) link.sendStart();
-  else link.sendContinue();
+  /*
+   * Always Start from a stopped transport. The device keeps its last
+   * playhead after Stop, so branching on bar/step/tick sent `continue` and
+   * left the engine parked at a stale position -- Play appeared to do
+   * nothing. Start resets the playhead and guarantees the engine runs.
+   */
+  link.sendStart();
 }
 
 function noteToTrack(note: number): number {
@@ -472,13 +482,18 @@ function render() {
   els.connDot.classList.toggle("stale", s.sync === "stale");
   els.btnConnect.classList.toggle("connected", s.connected);
   els.btnConnect.classList.toggle("stale", s.sync === "stale");
+  /*
+   * Badge text describes the CURRENT state, not the next action.
+   * "已连接" when synced; the disconnect affordance lives in the button
+   * title/aria-label so the label never contradicts the real link state.
+   */
   const syncText = !s.connected
     ? "连接设备"
     : s.sync === "connecting"
       ? "同步中…"
       : s.sync === "stale"
         ? `${s.deviceName} · 延迟`
-        : `${s.deviceName} · 断开`;
+        : `${s.deviceName} · 已连接`;
   els.connLabel.textContent = syncText;
   els.btnConnect.ariaLabel = s.connected ? "断开设备" : "连接设备";
   els.btnConnect.title = s.connected ? "点击断开" : "点击连接";
@@ -519,6 +534,28 @@ function render() {
   }
   els.metroState.textContent = s.click ? "开" : "关";
   els.drumState.textContent = s.drumMode ? "开" : "关";
+
+  /* --- runtime diagnostic panel: exposes the actual data path state --- */
+  dbgCounters.state++;
+  els.dbgBody.textContent = [
+    `connected : ${s.connected}`,
+    `sync      : ${s.sync}`,
+    `link      : ${s.link}`,
+    `drumMode  : ${s.drumMode}`,
+    `click     : ${s.click}`,
+    `run       : ${s.running}`,
+    `step      : ${s.step}`,
+    `bpm       : ${s.bpm}`,
+    `\u2014\u2014 counters \u2014\u2014`,
+    `render    : ${dbgCounters.state}`,
+    `rx lines  : ${linkDebug.rx}`,
+    `rx ok     : ${linkDebug.rxOk}`,
+    `rx BAD    : ${linkDebug.rxBad}`,
+    `tx sent   : ${linkDebug.tx}`,
+    `tx FAIL   : ${linkDebug.txFail}`,
+    `lastTx    : ${linkDebug.lastTx || "(none)"}`,
+    `badSample : ${linkDebug.lastBad || "(none)"}`,
+  ].join("\n");
   if (!s.connected && recording) stopRecording();
 
   els.btnClearTrack.disabled = !ready;
@@ -597,6 +634,19 @@ function mutatePattern(mutator: (pattern: PatternBanks) => PatternBanks) {
 }
 
 let keyFlashTimer = 0;
+
+/** Runtime counters for the on-screen diagnostic panel. */
+const dbgCounters = {
+  state: 0,
+  rx: 0,
+  rxOk: 0,
+  rxBad: 0,
+  tx: 0,
+  lastTx: "",
+  lastBad: "",
+};
+(window as unknown as { __dbg: typeof dbgCounters }).__dbg = dbgCounters;
+
 link.subscribe((s) => {
   if (s.running && s.beatInBar !== lastBeatIndex) {
     lastBeatIndex = s.beatInBar;
@@ -835,8 +885,8 @@ for (const pad of els.pads) {
     } else if (meta.role === "play") {
       const s = link.getState();
       if (s.running) link.sendStop();
-      else if (s.bar === 0 && s.step === 0 && s.tick === 0) link.sendStart();
-      else link.sendContinue();
+      /* Always Start from a stopped transport -- see toggleTransport(). */
+      else link.sendStart();
     }
   });
   const endS7 = (commitTap: boolean) => {

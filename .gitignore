@@ -34,3 +34,6 @@ out/
 
 # Keep sample placeholders, ignore large local packs
 assets/samples/local/
+
+# Local agent working memory / notes (not part of the project)
+.workbuddy/

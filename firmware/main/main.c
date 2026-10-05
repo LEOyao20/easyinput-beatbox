@@ -20,8 +20,12 @@ static uint16_t s_last_tick;
 static uint32_t s_quarter_count;
 static bool s_prev_keys[8];
 static bool s_fill_held;
-/* Power-on product mode is the standalone P1 metronome. */
-static bool s_drum_mode;
+/*
+ * Drum layer is ON at power-on: the sequencer gate in the audio engine is the
+ * only thing that can silence the pattern, and a silent drum machine reads as
+ * a broken product. The metronome click stays independently on as well.
+ */
+static bool s_drum_mode = true;
 /* Host UI overdub: lock S7 / S8 / encoder press while armed. */
 static bool s_record_armed;
 
@@ -54,6 +58,16 @@ static void render_event(const audio_beat_event_t *event, int64_t now_us)
     s_last_bar = event->bar;
     s_last_tick = event->tick;
 
+    /*
+     * TX budget: the beat/position stream shares one CDC endpoint with RX.
+     * `position` fires every 16th note; at 240 BPM that is 16 lines/sec, and
+     * each `printf`+`fflush` can block the main loop once the host stops
+     * draining. A blocked main loop starves `host_link_poll_rx()`, so host
+     * commands (start/continue/pattern_set) pile up unread and silently die.
+     *
+     * Keep the host position feed but let `render_event` decide per event
+     * instead of emitting both lines unconditionally on every tick.
+     */
     if (event->is_quarter) {
         led_status_on_beat((uint8_t)(s_quarter_count & 0xff), event->accent, now_us);
         host_link_send_beat(event->accent, event->beat_in_bar, event->step);
@@ -68,9 +82,17 @@ static void render_event(const audio_beat_event_t *event, int64_t now_us)
 static void transport_set(bool running, bool restart, bool from_host)
 {
     if (running) {
-        if (tempo_is_running() && !restart) {
-            return;
-        }
+        /*
+         * Do NOT early-return when the transport already looks running.
+         * `tempo_is_running()` (transport layer) and the audio engine's own
+         * `s_control.running` are two separate flags and can diverge -- e.g.
+         * a host `{"t":"continue"}` arrives while tempo already reports
+         * running, so the old `return` here skipped audio_click_set_running()
+         * entirely and the engine stayed silent with `run:false` reported to
+         * the host. Always push the state down to the audio engine so the two
+         * flags cannot drift apart.
+         */
+        const bool already_running = tempo_is_running();
         tempo_set_running(true);
         if (restart) {
             s_last_beat_in_bar = 0;
@@ -83,7 +105,8 @@ static void transport_set(bool running, bool restart, bool from_host)
             (void)audio_click_set_bpm(tempo_get_bpm());
             (void)audio_click_set_running(true, restart);
         }
-        ESP_LOGI(TAG, "%s @ %u BPM", restart ? "PLAY" : "CONTINUE", tempo_get_bpm());
+        ESP_LOGW(TAG, "%s @ %u BPM (was_running=%d)", restart ? "PLAY" : "CONTINUE",
+                 tempo_get_bpm(), already_running ? 1 : 0);
         if (!from_host) {
             if (restart) {
                 host_link_send_start();
@@ -105,7 +128,7 @@ static void transport_set(bool running, bool restart, bool from_host)
     if (s_audio_ready) {
         audio_click_get_position(&s_last_bar, &s_last_step, &s_last_beat_in_bar, &s_last_tick);
     }
-    ESP_LOGI(TAG, "STOP");
+    ESP_LOGW(TAG, "STOP");
     if (!from_host) {
         host_link_send_stop();
     }
@@ -146,8 +169,15 @@ static void on_host_fill(bool held)
     send_status();
 }
 
+/* Defined below; on_host_note/on_host_pattern_set may auto-enable the drum layer. */
+static void on_host_mode(bool drum_mode);
+
 static void on_host_note(uint8_t note, uint8_t velocity)
 {
+    /* Any drum/percussion note implies the user wants the drum layer audible. */
+    if (!s_drum_mode && beatbox_note_track(note) >= 0) {
+        on_host_mode(true);
+    }
     if (s_audio_ready) {
         (void)audio_click_play_note(note, velocity ? velocity : 127);
     }
@@ -185,6 +215,10 @@ static void on_host_pattern_set(uint8_t bank, uint32_t rev, const uint8_t *bytes
 {
     const esp_err_t err = pattern_set_bank(bank, rev, bytes);
     if (err == ESP_OK) {
+        /* Writing a pattern also implies the user expects to hear it. */
+        if (!s_drum_mode) {
+            on_host_mode(true);
+        }
         host_link_send_ack("pattern_set", true, pattern_revision());
         send_status();
     } else {
@@ -322,7 +356,13 @@ void app_main(void)
     if (s_audio_ready) {
         ESP_ERROR_CHECK(audio_click_set_bpm(tempo_get_bpm()));
         ESP_ERROR_CHECK(audio_click_set_metronome(pattern_click_enabled()));
-        ESP_ERROR_CHECK(audio_click_set_mode(AUDIO_MODE_METRONOME));
+        /*
+         * Apply the boot drum-mode default to the audio engine. This MUST match
+         * `s_drum_mode` above -- forcing METRONOME here silently overrode the
+         * drum layer at every power-on and made the pattern sequencer inaudible.
+         */
+        ESP_ERROR_CHECK(
+            audio_click_set_mode(s_drum_mode ? AUDIO_MODE_DRUM : AUDIO_MODE_METRONOME));
     }
 
     ESP_ERROR_CHECK(led_status_set_solid_rgb(0, 18, 0));
@@ -332,7 +372,12 @@ void app_main(void)
     host_link_send_hello();
     host_link_send_pattern_dump();
     send_status();
-    ESP_LOGI(TAG, "Ready. Pads=S1-6, S7=A/B|Fill-hold, Play=enc/S8, USB=Serial v2");
+    ESP_LOGW(TAG, "Ready. Pads=S1-6, S7=A/B|Fill-hold, Play=enc/S8, USB=Serial v2");
+    /* ESP_LOGW, not ESP_LOGI: sdkconfig pins the default level to WARN, which
+     * compiles INFO strings out of the image entirely. Boot state must be
+     * observable from the serial log. */
+    ESP_LOGW(TAG, "boot mode: drum=%d click=%d volume=%u", s_drum_mode ? 1 : 0,
+             pattern_click_enabled() ? 1 : 0, s_audio_ready ? audio_click_get_volume() : 0);
 
     int64_t last_status_us = 0;
     int64_t last_hello_us = 0;
@@ -341,6 +386,17 @@ void app_main(void)
     while (true) {
         board_input_snapshot_t in = {0};
         ESP_ERROR_CHECK(board_keys_poll(&in));
+
+        /*
+         * RX FIRST. `handle_pads()` / `render_event()` both write to stdout,
+         * and every `fflush(stdout)` can block once the CDC TX buffer fills.
+         * Polling host input before any of that keeps inbound commands
+         * (start / continue / pattern_set) from being starved behind our own
+         * outgoing telemetry. Previously this ran *after* handle_pads(), so a
+         * saturated TX path could starve RX indefinitely.
+         */
+        host_link_poll_rx();
+
         apply_encoder_bpm(in.enc_delta);
 
         /* S8 / encoder press: Play-Stop — locked out while host REC is armed. */
@@ -360,7 +416,6 @@ void app_main(void)
         }
 
         handle_pads(&in);
-        host_link_poll_rx();
 
         const int64_t now = esp_timer_get_time();
 
@@ -381,12 +436,23 @@ void app_main(void)
                                          &s_last_tick);
             }
             send_status();
+            ESP_LOGW(TAG, "rx: bytes=%lu lines=%lu errs=%lu errno=%d run=%d drum=%d",
+                     (unsigned long)host_link_rx_bytes(), (unsigned long)host_link_rx_lines(),
+                     (unsigned long)host_link_rx_errs(), host_link_rx_errno(),
+                     tempo_is_running() ? 1 : 0, s_drum_mode ? 1 : 0);
         }
         if (now - last_hello_us > 5000000) {
             last_hello_us = now;
             host_link_send_hello();
         }
 
-        vTaskDelay(1);
+        /*
+         * 1 tick (~10 ms at 100 Hz) rather than 1 ms. The loop performs
+         * blocking stdio on a shared CDC endpoint; spinning at 1 ms turned
+         * every TX stall into an RX starvation window. 100 Hz input polling
+         * is still far above human pad interaction rates, and the audio
+         * engine renders on its own task so transport timing is unaffected.
+         */
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

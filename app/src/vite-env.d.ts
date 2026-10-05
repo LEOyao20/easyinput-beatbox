@@ -15,12 +15,24 @@ interface SerialOptions {
   flowControl?: string;
 }
 
+/** Modem control line state, Web Serial `setSignals()`. */
+interface SerialOutputSignals {
+  dataTerminalReady?: boolean;
+  requestToSend?: boolean;
+  break?: boolean;
+}
+
 interface SerialPort extends EventTarget {
   readonly readable: ReadableStream<Uint8Array> | null;
   readonly writable: WritableStream<Uint8Array> | null;
   getInfo(): SerialPortInfo;
   open(options: SerialOptions): Promise<void>;
   close(): Promise<void>;
+  /**
+   * Required for ESP32-S3 USB-Serial/JTAG: the peripheral gates host->device
+   * data on DTR, so DTR must be asserted or the device reads an empty stdin.
+   */
+  setSignals(signals?: SerialOutputSignals): Promise<void>;
 }
 
 interface SerialPortFilter {

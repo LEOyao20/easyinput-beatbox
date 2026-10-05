@@ -55,6 +55,17 @@ typedef enum {
     VOICE_RIM,
 } voice_kind_t;
 
+/*
+ * Master output gain applied after the per-voice mix and the user volume
+ * scaling. Kept separate from `control.volume` (0..127) so overall loudness
+ * can exceed the volume slider's 100% ceiling without changing the relative
+ * balance between voices. Values above BEATBOX_VOLUME_MAX raise loudness
+ * beyond the previously achievable maximum; limit_sample() still guards
+ * against int16 clipping.
+ */
+#define AUDIO_MASTER_GAIN 200
+#define AUDIO_MASTER_GAIN_UNITY 100
+
 typedef struct {
     voice_kind_t kind;
     uint8_t velocity;
@@ -99,8 +110,8 @@ static audio_control_t s_control = {
     .running = false,
     .restart = true,
     .metronome = true,
-    .drum_mode = false,
-    .volume = 100,
+    .drum_mode = true,
+    .volume = BEATBOX_VOLUME_MAX,
     .bpm = 120,
 };
 /* Filled only from the audio task via sequencer callback (same-tick, no queue). */
@@ -321,15 +332,28 @@ static void clear_voices(audio_voice_t voices[AUDIO_VOICE_COUNT])
     memset(voices, 0, sizeof(audio_voice_t) * AUDIO_VOICE_COUNT);
 }
 
+/*
+ * Soft limiter. The previous knee (13000 -> ~18000 ceiling) sat far below the
+ * int16 full scale and squashed already-valid sample peaks, which is the main
+ * reason board output felt quiet. The knee is now placed near full scale so
+ * normal material passes through untouched and only genuine overload is
+ * rounded off. Ceiling ~31000 stays just inside int16 range.
+ */
+#define AUDIO_LIMIT_KNEE 26000
+#define AUDIO_LIMIT_SOFT_HEADROOM 9000
+#define AUDIO_LIMIT_SOFT_RANGE 4000
+#define AUDIO_LIMIT_CEILING (AUDIO_LIMIT_KNEE + AUDIO_LIMIT_SOFT_RANGE)
+
 static int16_t limit_sample(int32_t sample)
 {
     const int32_t sign = sample < 0 ? -1 : 1;
     int32_t magnitude = sample < 0 ? -sample : sample;
-    if (magnitude <= 13000) {
+    if (magnitude <= AUDIO_LIMIT_KNEE) {
         return (int16_t)sample;
     }
-    const int32_t excess = magnitude - 13000;
-    magnitude = 13000 + (excess * 5000) / (excess + 7000);
+    const int32_t excess = magnitude - AUDIO_LIMIT_KNEE;
+    magnitude = AUDIO_LIMIT_KNEE +
+                (excess * AUDIO_LIMIT_SOFT_RANGE) / (excess + AUDIO_LIMIT_SOFT_HEADROOM);
     return (int16_t)(sign * magnitude);
 }
 
@@ -481,6 +505,7 @@ static void audio_task(void *argument)
             }
 
             mixed = (mixed * (int32_t)control.volume) / BEATBOX_VOLUME_MAX;
+            mixed = (mixed * AUDIO_MASTER_GAIN) / AUDIO_MASTER_GAIN_UNITY;
             const int16_t output = limit_sample(mixed);
             s_render[frame * 2] = output;
             s_render[frame * 2 + 1] = output;

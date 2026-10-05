@@ -1014,6 +1014,36 @@ input[type="range"]:disabled {
   font: 0.7rem/1.5 var(--mono);
 }
 
+/* Runtime diagnostic panel — dev aid for tracing the host protocol path.
+   Fixed to the viewport so it stays visible without scrolling. */
+.debug-fixed {
+  position: fixed;
+  top: 8px;
+  right: 8px;
+  z-index: 9999;
+  width: 280px;
+  padding: 9px 11px;
+  border: 1px solid rgba(120, 200, 160, 0.35);
+  border-radius: 8px;
+  background: rgba(12, 20, 17, 0.94);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+
+.debug-head {
+  color: #7fd6a8;
+  font: 600 0.6rem/1 var(--mono);
+  letter-spacing: 0.14em;
+  margin-bottom: 6px;
+}
+
+.debug-fixed pre {
+  margin: 0;
+  color: #b6d8c6;
+  font: 0.62rem/1.4 var(--mono);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 @media (max-width: 880px) {
   #app {
     width: min(100% - 24px, 680px);

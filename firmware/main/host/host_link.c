@@ -3,6 +3,8 @@
 #include "clock.h"
 #include "pattern.h"
 
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
 #include "esp_log.h"
 
 #include <errno.h>
@@ -19,6 +21,35 @@ static bool s_ready;
 static char s_rx_buf[768];
 static size_t s_rx_len;
 static int s_stdin_flags_set;
+
+/* RX observability: distinguishes "host never sent" from "we never read". */
+static uint32_t s_rx_bytes;
+static uint32_t s_rx_lines;
+/* Hard read() failures and the last errno seen -- separates "queue empty" from
+ * "read path broken". A non-zero count with bytes stuck at 0 is the signature
+ * of an uninstalled USJ driver serving stdin. */
+static uint32_t s_rx_errs;
+static int s_rx_errno;
+
+uint32_t host_link_rx_bytes(void)
+{
+    return s_rx_bytes;
+}
+
+uint32_t host_link_rx_lines(void)
+{
+    return s_rx_lines;
+}
+
+uint32_t host_link_rx_errs(void)
+{
+    return s_rx_errs;
+}
+
+int host_link_rx_errno(void)
+{
+    return s_rx_errno;
+}
 
 static void host_write(const char *line)
 {
@@ -98,6 +129,37 @@ static bool extract_quoted_field(const char *line, const char *key, char *out, s
 
 esp_err_t host_link_init(void)
 {
+    /*
+     * Install the USB-Serial/JTAG driver and route the VFS through it.
+     *
+     * THE RX ROOT CAUSE. With CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y the console
+     * VFS attaches `usb_serial_jtag_rx_char_no_driver`, which reads the RX FIFO
+     * directly. But `usb_serial_jtag_read()` sizes every read via
+     * `usb_serial_jtag_get_read_bytes_available()`, and that function returns
+     * `bytes_available` from the driver's RX *ringbuffer* -- which only exists
+     * after `usb_serial_jtag_driver_install()`. With no driver installed it
+     * unconditionally returns 0, so in non-blocking mode `fetch_size` is always
+     * 0, `received` stays 0, and every `read()` returns -1/EWOULDBLOCK without
+     * ever touching the FIFO.
+     *
+     * Symptom: host->device is dead (`rx: bytes=0` forever) while device->host
+     * is perfectly healthy, because `usb_serial_jtag_write()` pushes straight
+     * to the TX FIFO and never consults the ringbuffer. That asymmetry is the
+     * signature of this bug.
+     *
+     * Installing the driver creates the RX ringbuffer the ISR fills, and
+     * `usb_serial_jtag_vfs_use_driver()` swaps rx_func to `usbjtag_rx_char_via_driver`
+     * so stdin drains that ringbuffer. This is exactly the pairing IDF's own
+     * test_apps use.
+     */
+    usb_serial_jtag_driver_config_t usj_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    usj_cfg.rx_buffer_size = 1024;
+    usj_cfg.tx_buffer_size = 1024;
+    const esp_err_t usj_err = usb_serial_jtag_driver_install(&usj_cfg);
+    if (usj_err == ESP_OK) {
+        usb_serial_jtag_vfs_use_driver();
+    }
+
     const int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     if (flags >= 0) {
         (void)fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
@@ -106,7 +168,9 @@ esp_err_t host_link_init(void)
 
     s_ready = true;
     s_rx_len = 0;
-    ESP_LOGI(TAG, "USB Serial host link ready (protocol v2)");
+    /* ESP_LOGW: sdkconfig pins the log level to WARN, so ESP_LOGI would be
+     * compiled out and this bring-up line would be invisible. */
+    ESP_LOGW(TAG, "host link ready: usj_driver=%d rx=1024 tx=1024", (int)usj_err);
     host_link_send_hello();
     return ESP_OK;
 }
@@ -360,6 +424,12 @@ static void handle_line(const char *line)
         }
         return;
     }
+
+    /*
+     * Anything reaching here was parsed as a valid JSON line with a "t" field
+     * but matched no command — log it so a dropped command is never invisible.
+     */
+    ESP_LOGW(TAG, "unhandled host cmd: %s", type);
 }
 
 void host_link_poll_rx(void)
@@ -372,14 +442,23 @@ void host_link_poll_rx(void)
     while (true) {
         const ssize_t n = read(STDIN_FILENO, chunk, sizeof(chunk));
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
+            /*
+             * Count hard errors separately from the benign "nothing queued"
+             * case. With the USJ driver installed, an empty ringbuffer reports
+             * EWOULDBLOCK/EAGAIN; anything else means the read path itself is
+             * broken (e.g. the pre-driver VFS returns -1 without setting errno).
+             */
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                s_rx_errno = errno ? errno : -1;
+                s_rx_errs++;
             }
             break;
         }
         if (n == 0) {
             break;
         }
+
+        s_rx_bytes += (uint32_t)n;
 
         for (ssize_t i = 0; i < n; ++i) {
             const char c = chunk[i];
@@ -389,6 +468,7 @@ void host_link_poll_rx(void)
             if (c == '\n') {
                 if (s_rx_len > 0) {
                     s_rx_buf[s_rx_len] = '\0';
+                    s_rx_lines++;
                     handle_line(s_rx_buf);
                     s_rx_len = 0;
                 }

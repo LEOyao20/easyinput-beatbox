@@ -17,6 +17,26 @@ export type { DeviceState as BeatboxState };
 
 type Listener = (state: DeviceState) => void;
 
+/** Optional runtime instrumentation hook (used by the diagnostic panel). */
+export type LinkDebugCounters = {
+  rx: number;
+  rxOk: number;
+  rxBad: number;
+  tx: number;
+  txFail: number;
+  lastTx: string;
+  lastBad: string;
+};
+export const linkDebug: LinkDebugCounters = {
+  rx: 0,
+  rxOk: 0,
+  rxBad: 0,
+  tx: 0,
+  txFail: 0,
+  lastTx: "",
+  lastBad: "",
+};
+
 const ESPRESSIF_VID = 0x303a;
 
 export class BeatboxLink {
@@ -114,6 +134,24 @@ export class BeatboxLink {
     this.port = port;
 
     await port.open({ baudRate: 115200 });
+
+    /*
+     * Raise DTR/RTS on the ESP32-S3 USB-Serial/JTAG endpoint.
+     *
+     * The USB-Serial/JTAG peripheral gates HOST -> DEVICE data on the modem
+     * control lines: with DTR deasserted the device sees an empty stdin and
+     * `read()` never returns a byte, so every command we write is silently
+     * dropped on arrival. Web Serial's `open()` does NOT assert them by
+     * default, which made the device report `rx: bytes=0` forever while the
+     * page happily showed "connected" (device -> host traffic was fine,
+     * because that direction is not gated).
+     */
+    try {
+      await port.setSignals({ dataTerminalReady: true, requestToSend: true });
+    } catch {
+      /* Non-fatal: some platforms/ports do not expose modem control lines. */
+    }
+
     this.writer = port.writable?.getWriter() ?? null;
     this.reader = port.readable?.getReader() ?? null;
     this.readLoopActive = true;
@@ -196,14 +234,33 @@ export class BeatboxLink {
   }
 
   private onLine(line: string) {
+    linkDebug.rx++;
+    if (line.startsWith("{")) {
+      try {
+        JSON.parse(line);
+        linkDebug.rxOk++;
+      } catch {
+        linkDebug.rxBad++;
+        linkDebug.lastBad = line.slice(0, 120);
+        console.warn("[beatbox] malformed rx line:", line.slice(0, 200));
+      }
+    }
     this.patch((s) => reduceHostLine(s, line));
   }
 
   private async writeLine(line: string) {
-    if (!this.writer) return;
+    if (!this.writer) {
+      linkDebug.txFail++;
+      linkDebug.lastTx = `(no writer) ${line}`;
+      return;
+    }
+    linkDebug.lastTx = line;
     try {
       await this.writer.write(this.encoder.encode(line + "\n"));
+      /* Counted only after a successful write: tx means "reached the port". */
+      linkDebug.tx++;
     } catch {
+      linkDebug.txFail++;
       this.patch((s) => markDisconnected(s, "写入失败，正在重连…"));
       void this.closePort();
     }
