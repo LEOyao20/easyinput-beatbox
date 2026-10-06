@@ -22,6 +22,7 @@ esp_err_t led_status_clear(void);
  */
 typedef struct {
     bool running;       /* transport running (false = free / idle mode) */
+    bool drum_mode;     /* drum layer on; when off no pattern is engaged */
     uint8_t variation;  /* 0 = bank A, 1 = bank B */
     bool fill;          /* long-press fill engaged; overrides A/B */
     uint16_t bpm;       /* used only by the encoder tempo preview */

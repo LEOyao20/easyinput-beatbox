@@ -110,7 +110,8 @@ static audio_control_t s_control = {
     .running = false,
     .restart = true,
     .metronome = true,
-    .drum_mode = true,
+    /* Boot applies this from main.c's s_drum_mode; keep the two in sync. */
+    .drum_mode = false,
     .volume = BEATBOX_VOLUME_MAX,
     .bpm = 120,
 };

@@ -20,11 +20,16 @@ static uint16_t s_last_tick;
 static bool s_prev_keys[8];
 static bool s_fill_held;
 /*
- * Drum layer is ON at power-on: the sequencer gate in the audio engine is the
- * only thing that can silence the pattern, and a silent drum machine reads as
- * a broken product. The metronome click stays independently on as well.
+ * Drum layer is OFF at power-on: the board boots as a metronome so the player
+ * gets a click to practise against without Pattern A starting up underneath
+ * them. The click runs on its own switch and is also on by default, so
+ * power-on + Play gives a clean metronome.
+ *
+ * This is NOT just a volume switch: the drum layer also gates the SEQUENCER,
+ * so turning it on is what makes Pattern A audible. The web UI's drum toggle
+ * sends the explicit `mode` command that flips it.
  */
-static bool s_drum_mode = true;
+static bool s_drum_mode = false;
 /* Host UI overdub: lock S7 / S8 / encoder press while armed. */
 static bool s_record_armed;
 
@@ -165,15 +170,20 @@ static void on_host_fill(bool held)
     send_status();
 }
 
-/* Defined below; on_host_note/on_host_pattern_set may auto-enable the drum layer. */
-static void on_host_mode(bool drum_mode);
-
 static void on_host_note(uint8_t note, uint8_t velocity)
 {
-    /* Any drum/percussion note implies the user wants the drum layer audible. */
-    if (!s_drum_mode && beatbox_note_track(note) >= 0) {
-        on_host_mode(true);
-    }
+    /*
+     * Play the pad, and nothing else.
+     *
+     * This used to auto-enable the drum layer when it was off, on the theory
+     * that "a drum note means the user wants to hear drums". That was wrong:
+     * the drum layer also gates the SEQUENCER, so with the transport running a
+     * single pad tap would switch playback over to Pattern A -- the pad stopped
+     * behaving like a pad and started acting as a transport control.
+     *
+     * Mode is now changed only by an explicit `mode` command, so a performance
+     * gesture can never silently reconfigure the instrument.
+     */
     if (s_audio_ready) {
         (void)audio_click_play_note(note, velocity ? velocity : 127);
     }
@@ -211,10 +221,12 @@ static void on_host_pattern_set(uint8_t bank, uint32_t rev, const uint8_t *bytes
 {
     const esp_err_t err = pattern_set_bank(bank, rev, bytes);
     if (err == ESP_OK) {
-        /* Writing a pattern also implies the user expects to hear it. */
-        if (!s_drum_mode) {
-            on_host_mode(true);
-        }
+        /*
+         * Store and acknowledge. Deliberately does NOT enable the drum layer:
+         * writing a pattern is not a request to start playing, and with the
+         * transport running the old auto-enable made a single grid edit kick
+         * Pattern A into the speakers. The user's explicit `mode` choice wins.
+         */
         host_link_send_ack("pattern_set", true, pattern_revision());
         send_status();
     } else {
@@ -241,6 +253,34 @@ static void on_host_record(bool armed)
     if (armed && s_fill_held) {
         on_host_fill(false);
     }
+}
+
+/*
+ * One Play/Stop control. Both transport buttons share this, differing in which
+ * layers they bring in when STARTING:
+ *
+ *   encoder knob -> metronome only (drum layer off): a click to practise to
+ *   S8           -> metronome + drum layer: the pattern plays as well
+ *
+ * Stop behaves the same for both, and the mode is asserted only on start, so
+ * stopping a performance never silently reconfigures the instrument.
+ */
+static void transport_button(bool with_drums)
+{
+    if (tempo_is_running()) {
+        transport_set(false, false, false);
+        return;
+    }
+    if (with_drums) {
+        if (!s_drum_mode) {
+            on_host_mode(true);
+        }
+    } else if (s_drum_mode) {
+        on_host_mode(false);
+    }
+    /* Resume from the saved position; Start only when already at zero. */
+    const bool at_zero = s_last_bar == 0 && s_last_step == 0 && s_last_tick == 0;
+    transport_set(true, at_zero, false);
 }
 
 static void handle_pads(const board_input_snapshot_t *in)
@@ -395,19 +435,22 @@ void app_main(void)
 
         apply_encoder_bpm(in.enc_delta);
 
-        /* S8 / encoder press: Play-Stop — locked out while host REC is armed. */
-        if (in.enc_press && !s_record_armed) {
-            /* Encoder click mirrors S8 in the host pad matrix when S8 wasn't the source. */
-            if (!in.s[7]) {
-                host_link_send_key(7, true);
-            }
-            if (tempo_is_running()) {
-                transport_set(false, false, false);
-            } else {
-                /* Resume from saved position; Start only when already at zero. */
-                const bool at_zero =
-                    s_last_bar == 0 && s_last_step == 0 && s_last_tick == 0;
-                transport_set(true, at_zero, false);
+        /*
+         * Two transport buttons, deliberately different:
+         *   encoder knob -> metronome only
+         *   S8           -> metronome + drum layer
+         * Locked out while the host REC is armed.
+         */
+        if (!s_record_armed) {
+            if (in.s8_press) {
+                /* handle_pads() already mirrors S8 into the host pad matrix. */
+                transport_button(true);
+            } else if (in.enc_press) {
+                /* The knob has no pad-matrix entry of its own; synthesise one. */
+                if (!in.s[7]) {
+                    host_link_send_key(7, true);
+                }
+                transport_button(false);
             }
         }
 
@@ -430,6 +473,7 @@ void app_main(void)
              */
             const led_status_input_t led_in = {
                 .running = tempo_is_running(),
+                .drum_mode = s_drum_mode,
                 .variation = pattern_variation(),
                 .fill = pattern_fill_active(),
                 .bpm = tempo_get_bpm(),

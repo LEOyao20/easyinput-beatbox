@@ -17,13 +17,42 @@ static const int s_key_gpios[8] = {
 static pcnt_unit_handle_t s_encoder_unit;
 static int s_encoder_consumed_count;
 
-/* Debounced encoder press / S8 used for transport. */
-static bool s_press_raw = false;
-static bool s_press_stable = false;
-static int64_t s_press_change_us = 0;
-static bool s_press_edge = false;
-
+/* A press must hold this long before it counts, to reject contact bounce. */
 #define PRESS_DEBOUNCE_US 25000
+
+/*
+ * Debounced push button, rising-edge only.
+ *
+ * The encoder switch and S8 are separate transport controls with different
+ * meaning -- the knob plays the metronome alone, S8 brings the drum layer in.
+ * They used to be OR-ed into one signal, which made the firmware unable to
+ * tell them apart. Each gets its own state machine.
+ */
+typedef struct {
+    bool level;
+    bool stable;
+    int64_t change_us;
+    bool edge;
+} debounce_t;
+
+static debounce_t s_enc_db;
+static debounce_t s_s8_db;
+
+/* Returns true on the single poll where the button settles into "pressed". */
+static bool debounce_update(debounce_t *d, bool level, int64_t now)
+{
+    d->edge = false;
+    if (level != d->level) {
+        d->level = level;
+        d->change_us = now;
+    } else if ((now - d->change_us) >= PRESS_DEBOUNCE_US && level != d->stable) {
+        d->stable = level;
+        if (d->stable) {
+            d->edge = true;
+        }
+    }
+    return d->edge;
+}
 
 #define ENCODER_COUNTS_PER_DETENT 4
 
@@ -105,11 +134,12 @@ esp_err_t board_keys_init(void)
     ESP_RETURN_ON_ERROR(gpio_config(&cfg), TAG, "gpio_config failed");
 
     ESP_RETURN_ON_ERROR(encoder_pcnt_init(), TAG, "encoder PCNT init");
-    s_press_raw = false;
-    s_press_stable = false;
-    s_press_change_us = esp_timer_get_time();
-    s_press_edge = false;
-    ESP_LOGI(TAG, "keys + encoder ready");
+    s_enc_db.level = false;
+    s_enc_db.stable = false;
+    s_enc_db.change_us = esp_timer_get_time();
+    s_enc_db.edge = false;
+    s_s8_db = s_enc_db;
+    ESP_LOGW(TAG, "keys + encoder ready");
     return ESP_OK;
 }
 
@@ -123,22 +153,14 @@ esp_err_t board_keys_poll(board_input_snapshot_t *out)
         out->s[i] = gpio_get_level(s_key_gpios[i]) == 0;
     }
 
-    /* Transport buttons: encoder press OR S8. */
-    const bool raw = (gpio_get_level(BOARD_GPIO_ENC_PRESS) == 0) || out->s[7];
+    /*
+     * Two INDEPENDENT transport buttons. Do not combine them: the knob starts
+     * metronome-only playback while S8 brings in the drum layer, so the rest
+     * of the firmware has to know which one was actually pressed.
+     */
     const int64_t now = esp_timer_get_time();
-    s_press_edge = false;
-
-    if (raw != s_press_raw) {
-        s_press_raw = raw;
-        s_press_change_us = now;
-    } else if ((now - s_press_change_us) >= PRESS_DEBOUNCE_US && raw != s_press_stable) {
-        s_press_stable = raw;
-        if (s_press_stable) {
-            s_press_edge = true; /* rising edge after debounce = one clean press */
-        }
-    }
-
-    out->enc_press = s_press_edge;
+    out->enc_press = debounce_update(&s_enc_db, gpio_get_level(BOARD_GPIO_ENC_PRESS) == 0, now);
+    out->s8_press = debounce_update(&s_s8_db, out->s[7], now);
 
     out->enc_delta = 0;
 
@@ -146,7 +168,7 @@ esp_err_t board_keys_poll(board_input_snapshot_t *out)
     ESP_RETURN_ON_ERROR(pcnt_unit_get_count(s_encoder_unit, &raw_count), TAG, "pcnt read");
     const int pending_counts = raw_count - s_encoder_consumed_count;
     const int detents = pending_counts / ENCODER_COUNTS_PER_DETENT;
-    if (s_press_stable) {
+    if (s_enc_db.stable) {
         /* Do not replay movement made while the knob is pressed. */
         s_encoder_consumed_count = raw_count;
     } else if (detents != 0) {

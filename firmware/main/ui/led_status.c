@@ -26,13 +26,25 @@ static led_strip_handle_t s_strip;
 #define HIT_SPAN (HIT_PIXEL_COUNT - 1)
 
 /*
- * Mode palette. Each entry owns a distinct region of the colour wheel so the
- * status is unambiguous at a glance: blue (idle) / green (A) / purple (B) /
- * red (fill).
+ * Mode palette. Five states, five colours, each owning a distinct region of
+ * the wheel so no two can be confused:
+ *
+ *   idle (stopped)        blue
+ *   metronome running     yellow
+ *   pattern A running     green
+ *   pattern B running     purple
+ *   fill engaged          red
+ *
+ * Yellow is chosen for the metronome because it shares no channel pattern
+ * with the others: red is (255,0,0) with no green at all, while yellow keeps
+ * green high; green carries no red; blue and purple sit opposite it.
  */
 #define MODE_IDLE_R 0
 #define MODE_IDLE_G 40
-#define MODE_IDLE_B 255 /* 自由模式（停止待机） */
+#define MODE_IDLE_B 255 /* 停止待机 */
+#define MODE_METRO_R 255
+#define MODE_METRO_G 210
+#define MODE_METRO_B 0 /* 节拍器练习（鼓组关闭且传送带在跑） */
 #define MODE_A_R 0
 #define MODE_A_G 220
 #define MODE_A_B 40 /* Pattern A */
@@ -43,7 +55,7 @@ static led_strip_handle_t s_strip;
 #define MODE_FILL_G 0
 #define MODE_FILL_B 0 /* 长按加花 */
 
-/* Idle is dimmer than playing, so the strip reads as "armed" vs "running". */
+/* Idle is dimmer than every playing state, so "armed" and "running" separate. */
 #define MODE_IDLE_SCALE 96
 #define MODE_ACTIVE_SCALE 170
 
@@ -160,7 +172,25 @@ esp_err_t led_status_update(int64_t now_us, const led_status_input_t *input)
     uint8_t g = MODE_IDLE_G;
     uint8_t b = MODE_IDLE_B;
     uint8_t scale = MODE_IDLE_SCALE;
-    if (input->fill) {
+    if (!input->drum_mode) {
+        /*
+         * No pattern can sound with the drum layer off. Split the two cases so
+         * they get genuinely different colours rather than one hue at two
+         * brightnesses: running means the player is practising against the
+         * click, stopped means the instrument is idle.
+         *
+         * Checked before `fill` because fill is inert in this state and a stale
+         * fill flag must not light red for something that cannot sound.
+         */
+        if (input->running) {
+            r = MODE_METRO_R;
+            g = MODE_METRO_G;
+            b = MODE_METRO_B;
+            scale = MODE_ACTIVE_SCALE;
+        } else {
+            scale = MODE_IDLE_SCALE;
+        }
+    } else if (input->fill) {
         /* Fill wins over A/B: it is the layer actually being heard. */
         r = MODE_FILL_R;
         g = MODE_FILL_G;
